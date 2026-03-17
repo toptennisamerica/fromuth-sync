@@ -1,29 +1,31 @@
 name: Fromuth Sync
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 6-20/2 * * *"
-  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          python -m playwright install --with-deps chromium
 
-      - name: Run scraper
+      - name: Run Fromuth sync
         env:
           FROMUTH_START_URLS: ${{ secrets.FROMUTH_START_URLS }}
           SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
@@ -32,5 +34,16 @@ jobs:
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
           DRY_RUN: "false"
           REQUEST_TIMEOUT: "90"
+          MAX_PRODUCTS: "0"
         run: |
           python -m src.main
+
+      - name: Upload output files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fromuth-sync-output
+          path: |
+            data/products.json
+            data/sync_results.json
+          if-no-files-found: ignore

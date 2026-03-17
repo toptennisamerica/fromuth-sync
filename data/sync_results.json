@@ -1,0 +1,42 @@
+{
+  "actions": [
+    {
+      "sku": "",
+      "action": "create_product",
+      "status": "success",
+      "notes": "Created draft Shopify product 10143294718247",
+      "product_title": "Mizuno Wave Strike AC Men's Shoes",
+      "old_quantity": null,
+      "new_quantity": null,
+      "old_price": null,
+      "new_price": null
+    },
+    {
+      "sku": "",
+      "action": "create_product",
+      "status": "success",
+      "notes": "Created draft Shopify product 10143297306919",
+      "product_title": "Mizuno Wave Enforce Tour 2 AC Men's Shoes",
+      "old_quantity": null,
+      "new_quantity": null,
+      "old_price": null,
+      "new_price": null
+    },
+    {
+      "sku": "",
+      "action": "create_product",
+      "status": "success",
+      "notes": "Created draft Shopify product 10143304253735",
+      "product_title": "Mizuno Wave Exceed Court AC Men's Shoes",
+      "old_quantity": null,
+      "new_quantity": null,
+      "old_price": null,
+      "new_price": null
+    }
+  ],
+  "errors": [],
+  "summary": {
+    "created_products": 3,
+    "updated_inventory": 104
+  }
+}

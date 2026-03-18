@@ -19,6 +19,8 @@ logger = get_logger(__name__)
 
 
 class SyncOrchestrator:
+    SHOPIFY_VARIANT_LIMIT = 100
+
     def __init__(self, shopify: ShopifyClient, dry_run: bool = True) -> None:
         self.shopify = shopify
         self.dry_run = dry_run
@@ -67,11 +69,18 @@ class SyncOrchestrator:
         """
         title = clean_text(product.title)
 
+        # Remove common seasonal suffixes
         title = re_sub(r"\s*\|\s*fall/winter\s+\d{4}\s*$", "", title)
         title = re_sub(r"\s*\|\s*spring/summer\s+\d{4}\s*$", "", title)
-        title = re_sub(r"\s{2,}", " ", title).strip()
 
-        return title
+        # Remove plain trailing year after a pipe, e.g. " | 2024"
+        title = re_sub(r"\s*\|\s*\d{4}\s*$", "", title)
+
+        title = re_sub(r"\s{2,}", " ", title).strip(" -|")
+        return title.strip()
+
+    def _variant_count_exceeds_shopify_limit(self, product: ProductRecord) -> bool:
+        return len(product.variants) > self.SHOPIFY_VARIANT_LIMIT
 
     def _sync_product(
         self,
@@ -81,6 +90,28 @@ class SyncOrchestrator:
         results: SyncResults,
         counters: Counter,
     ) -> None:
+        if self._variant_count_exceeds_shopify_limit(product):
+            results.add(
+                SyncAction(
+                    sku="",
+                    action="skip_product_too_many_variants",
+                    status="skipped",
+                    product_title=product.resolved_title(),
+                    notes=(
+                        f"Skipped because product has {len(product.variants)} variants, "
+                        f"exceeding Shopify's {self.SHOPIFY_VARIANT_LIMIT}-variant REST limit"
+                    ),
+                )
+            )
+            counters["skipped_too_many_variants"] += 1
+            logger.warning(
+                "Skipping %s because it has %s variants, exceeding Shopify limit of %s",
+                product.resolved_title(),
+                len(product.variants),
+                self.SHOPIFY_VARIANT_LIMIT,
+            )
+            return
+
         content = self.content_generator.generate(product)
         matched_parent = self.shopify.find_product_ref(product, product_index)
         existing_sku_found = any(v.sku in sku_index for v in product.variants)

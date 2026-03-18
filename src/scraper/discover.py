@@ -12,6 +12,7 @@ logger = get_logger(__name__)
 class ProductDiscoverer:
     def __init__(self, client):
         self.client = client
+        self.max_pages_per_start_url = 8
 
     def discover(self, start_urls: list[str], max_products: int | None = None) -> list[str]:
         found: list[str] = []
@@ -20,7 +21,7 @@ class ProductDiscoverer:
         for start_url in start_urls:
             page_num = 1
 
-            while True:
+            while page_num <= self.max_pages_per_start_url:
                 page_url = self._page_url(start_url, page_num)
                 logger.info("Discovering from %s", page_url)
 
@@ -30,16 +31,35 @@ class ProductDiscoverer:
                 product_urls = self._extract_product_urls(start_url, soup)
                 new_urls = [u for u in product_urls if u not in seen]
 
+                logger.info(
+                    "Found %s product URLs on page %s (%s new)",
+                    len(product_urls),
+                    page_num,
+                    len(new_urls),
+                )
+
                 for url in new_urls:
                     seen.add(url)
                     found.append(url)
                     if max_products and len(found) >= max_products:
+                        logger.info("Reached max_products=%s during discovery", max_products)
                         return found
+
+                if not new_urls and page_num > 1:
+                    logger.info("No new product URLs found on page %s, stopping pagination for this start URL", page_num)
+                    break
 
                 if not self._has_next_page(soup, page_num):
                     break
 
                 page_num += 1
+
+            if page_num > self.max_pages_per_start_url:
+                logger.info(
+                    "Stopped pagination for %s after hitting max_pages_per_start_url=%s",
+                    start_url,
+                    self.max_pages_per_start_url,
+                )
 
         return found
 
@@ -54,15 +74,14 @@ class ProductDiscoverer:
             "[data-product-id]",
             ".productGrid .product",
             ".productGrid .card",
+            ".productGrid-item",
+            ".productView",
+            ".productList .product",
         ]
 
         cards = []
         for selector in card_selectors:
             cards.extend(soup.select(selector))
-
-        # Fallback: some pages may wrap product cards differently
-        if not cards:
-            cards = soup.select("article, li")
 
         for card in cards:
             anchors = card.select("a[href]")
@@ -82,6 +101,23 @@ class ProductDiscoverer:
                 urls.append(full_url)
                 break
 
+        # Safer fallback: only inspect likely product anchors, not every article/li
+        if not urls:
+            for a in soup.select("a[href]"):
+                href = (a.get("href") or "").strip()
+                if not href:
+                    continue
+
+                full_url = self._normalize_url(urljoin(base_url, href))
+                if not self._is_product_url(full_url):
+                    continue
+
+                if full_url in seen:
+                    continue
+
+                seen.add(full_url)
+                urls.append(full_url)
+
         return urls
 
     def _is_product_url(self, url: str) -> bool:
@@ -96,8 +132,7 @@ class ProductDiscoverer:
 
         parts = [p for p in path.split("/") if p]
 
-        # Real product URLs on Fromuth are typically one-segment slugs
-        # like /mizuno-wave-strike-ac-mens-fall-winter-2026/
+        # Fromuth product URLs are typically a single slug path.
         if len(parts) != 1:
             return False
 
@@ -154,15 +189,20 @@ class ProductDiscoverer:
             "/paddles/",
             "/balls/",
             "/grips/",
-            "/strings",
+            "/strings/",
             "/string-types/",
             "/clearance/",
+            "#",
         ]
         if any(token in lowered_full for token in blocked_contains):
             return False
 
-        # Product slugs are usually descriptive and long enough
         if len(slug) < 12:
+            return False
+
+        # Must look like a real product slug, not a generic page
+        has_dash = "-" in slug
+        if not has_dash:
             return False
 
         return True

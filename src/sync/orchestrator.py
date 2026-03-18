@@ -63,20 +63,13 @@ class SyncOrchestrator:
             variant.price = variant.price or product.price
 
     def _normalized_product_title(self, product: ProductRecord) -> str:
-        """
-        Keep the source title authoritative.
-        Do not append or infer Men's / Women's / Unisex here.
-        """
         title = clean_text(product.title)
 
-        # Remove common seasonal suffixes
         title = re_sub(r"\s*\|\s*fall/winter\s+\d{4}\s*$", "", title)
         title = re_sub(r"\s*\|\s*spring/summer\s+\d{4}\s*$", "", title)
-
-        # Remove plain trailing year after a pipe, e.g. " | 2024"
         title = re_sub(r"\s*\|\s*\d{4}\s*$", "", title)
-
         title = re_sub(r"\s{2,}", " ", title).strip(" -|")
+
         return title.strip()
 
     def _variant_count_exceeds_shopify_limit(self, product: ProductRecord) -> bool:
@@ -116,9 +109,9 @@ class SyncOrchestrator:
         matched_parent = self.shopify.find_product_ref(product, product_index)
         existing_sku_found = any(v.sku in sku_index for v in product.variants)
 
-        # Existing product or any existing SKU: stock-only mode
+        # Existing product or any existing SKU: inventory only
         if matched_parent or existing_sku_found:
-            self._sync_existing_product_stock_only(
+            self._sync_existing_product_inventory_only(
                 matched_parent=matched_parent,
                 product=product,
                 sku_index=sku_index,
@@ -128,7 +121,7 @@ class SyncOrchestrator:
             )
             return
 
-        # New product: create full listing once
+        # New product: full create once
         matched_parent = self._create_parent_product(
             product=product,
             content=content,
@@ -138,7 +131,7 @@ class SyncOrchestrator:
             counters=counters,
         )
 
-        if self.dry_run:
+        if self.dry_run or not matched_parent:
             return
 
         scraped_skus: Set[str] = set()
@@ -148,7 +141,7 @@ class SyncOrchestrator:
             existing = sku_index.get(variant.sku)
 
             if existing:
-                self._update_existing_variant_stock_only(
+                self._update_existing_variant_inventory_only(
                     existing=existing,
                     product=product,
                     variant=variant,
@@ -158,29 +151,16 @@ class SyncOrchestrator:
                 )
                 continue
 
-            parent_ref = matched_parent or self.shopify.find_product_ref(product, product_index)
-            if parent_ref:
-                self._create_missing_variant(
-                    parent_ref=parent_ref,
-                    product=product,
-                    variant=variant,
-                    sku_index=sku_index,
-                    results=results,
-                    counters=counters,
-                )
-            else:
-                results.add(
-                    SyncAction(
-                        sku=variant.sku,
-                        action="unmatched_parent",
-                        status="skipped",
-                        product_title=product.resolved_title(),
-                        notes="SKU not found and parent product match was unclear",
-                    )
-                )
-                counters["skipped"] += 1
+            self._create_missing_variant(
+                parent_ref=matched_parent,
+                product=product,
+                variant=variant,
+                sku_index=sku_index,
+                results=results,
+                counters=counters,
+            )
 
-        if matched_parent and product.scrape_ok_for_zeroing:
+        if product.scrape_ok_for_zeroing:
             self._zero_missing_variants(
                 matched_parent=matched_parent,
                 scraped_skus=scraped_skus,
@@ -190,7 +170,7 @@ class SyncOrchestrator:
                 counters=counters,
             )
 
-    def _sync_existing_product_stock_only(
+    def _sync_existing_product_inventory_only(
         self,
         matched_parent: ShopifyProductMatch | None,
         product: ProductRecord,
@@ -199,15 +179,6 @@ class SyncOrchestrator:
         results: SyncResults,
         counters: Counter,
     ) -> None:
-        """
-        Existing Shopify products should only update stock.
-        No title updates.
-        No description updates.
-        No tag updates.
-        No image updates.
-        No price updates.
-        No variant creation.
-        """
         if not matched_parent:
             matched_parent = self.shopify.find_product_ref(product, product_index)
 
@@ -224,13 +195,13 @@ class SyncOrchestrator:
                         action="skip_missing_existing_variant",
                         status="skipped",
                         product_title=product.resolved_title(),
-                        notes="Existing product is in stock-only mode; missing variant was not created",
+                        notes="Existing product is in inventory-only mode; missing variant was not created",
                     )
                 )
                 counters["skipped_missing_variants"] += 1
                 continue
 
-            self._update_existing_variant_stock_only(
+            self._update_existing_variant_inventory_only(
                 existing=existing,
                 product=product,
                 variant=variant,
@@ -275,9 +246,8 @@ class SyncOrchestrator:
         created_product = created["product"]
         product_id = int(created_product["id"])
 
-        # Only on first creation do we write content/images/SEO
+        # Only on initial creation do we write content/body/SEO.
         self.shopify.update_product_seo_and_body(product_id, product, content)
-        self.shopify.update_product_images(product_id, product, content)
 
         variant_ids = []
         for created_variant in created_product.get("variants", []):
@@ -329,7 +299,7 @@ class SyncOrchestrator:
         counters["created_products"] += 1
         return matched_parent
 
-    def _update_existing_variant_stock_only(
+    def _update_existing_variant_inventory_only(
         self,
         existing: ShopifyVariantMatch,
         product: ProductRecord,
@@ -362,7 +332,7 @@ class SyncOrchestrator:
                     old_quantity=existing.inventory_quantity,
                     new_quantity=target_qty,
                     product_title=product.resolved_title(),
-                    notes="Stock-only mode for existing product",
+                    notes="Inventory-only mode for existing product",
                 )
             )
         else:

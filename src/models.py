@@ -49,6 +49,7 @@ class ProductRecord:
     brand: str = ""
     series: str = ""
     model: str = ""
+    gender: str = ""
     product_type: str = "Tennis Shoes"
     vendor: str = ""
     normalized_title: str = ""
@@ -146,7 +147,13 @@ class SyncResults:
     def bump(self, key: str, count: int = 1) -> None:
         self.summary[key] = self.summary.get(key, 0) + count
 
-    def add_error(self, message: str, sku: str = "", product_title: str = "", details: Optional[Dict[str, Any]] = None) -> None:
+    def add_error(
+        self,
+        message: str,
+        sku: str = "",
+        product_title: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
         payload: Dict[str, Any] = {
             "message": message,
             "sku": sku,

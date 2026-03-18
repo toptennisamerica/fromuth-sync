@@ -340,7 +340,6 @@ class SyncOrchestrator:
         else:
             if existing.inventory_item_id is not None:
                 self.shopify.set_inventory(existing.inventory_item_id, target_qty)
-            self.shopify.update_variant_inventory_policy(existing.variant_id, variant.available_to_order)
 
         counters["updated_inventory"] += 1
 
@@ -387,8 +386,6 @@ class SyncOrchestrator:
 
         if parsed_inventory_item_id is not None:
             self.shopify.set_inventory(parsed_inventory_item_id, variant.normalized_inventory())
-
-        self.shopify.update_variant_inventory_policy(int(created_variant["id"]), variant.available_to_order)
 
         results.add(
             SyncAction(

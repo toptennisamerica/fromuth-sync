@@ -28,8 +28,6 @@ class ShopifyClient:
         self.session = requests.Session()
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
-
-        # Proactive throttling: stay safely under Shopify REST limits.
         self._last_request_time = 0.0
         self._min_interval = 0.8
 
@@ -105,7 +103,6 @@ class ShopifyClient:
                 self._access_token = None
                 self._access_token_expires_at = 0.0
                 self._get_valid_access_token()
-
                 self._throttle()
                 response = self.session.request(
                     method,
@@ -163,12 +160,6 @@ class ShopifyClient:
 
             return response.json() if response.text else {}
 
-        print("\n=== SHOPIFY ERROR ===")
-        print("METHOD:", method)
-        print("URL:", url)
-        print("STATUS:", 429)
-        if json_payload is not None:
-            print("REQUEST PAYLOAD:", json_payload)
         raise RuntimeError(f"Shopify request failed after {max_attempts} attempts: {method} {path}")
 
     def _get(self, path: str, params: dict | None = None):
@@ -188,72 +179,55 @@ class ShopifyClient:
         }
 
         while True:
-            data = self._get("/products.json", params=params)
-            products.extend(data.get("products", []))
+            self._get_valid_access_token()
+            self._throttle()
 
-            next_page_info = self._extract_next_page_info(
-                self.session.headers.get("Link", "")
+            response = self.session.get(
+                f"{self.base_url}/products.json",
+                params=params,
+                timeout=self.settings.request_timeout,
             )
 
-            # _request does not store response headers, so fetch Link header separately
-            # by repeating the last request is wasteful. Instead, use the last response URL
-            # pattern only when pagination exists in returned count.
-            # Safer approach: inspect headers through a direct request wrapper.
-            # Since Shopify pagination depends on Link header, use a dedicated direct call below.
-            if len(data.get("products", [])) < 250:
-                break
+            if response.status_code == 401:
+                self._access_token = None
+                self._access_token_expires_at = 0.0
+                self._get_valid_access_token()
+                self._throttle()
+                response = self.session.get(
+                    f"{self.base_url}/products.json",
+                    params=params,
+                    timeout=self.settings.request_timeout,
+                )
 
-            page_info = self._fetch_next_page_info_for_products(params)
-            if not page_info:
+            if response.status_code == 429:
+                retry_after_header = clean_text(response.headers.get("Retry-After"))
+                try:
+                    retry_after = float(retry_after_header) if retry_after_header else 2.0
+                except Exception:
+                    retry_after = 2.0
+                time.sleep(max(retry_after, 2.0))
+                self._throttle()
+                response = self.session.get(
+                    f"{self.base_url}/products.json",
+                    params=params,
+                    timeout=self.settings.request_timeout,
+                )
+
+            response.raise_for_status()
+            data = response.json()
+            products.extend(data.get("products", []))
+
+            next_page_info = self._extract_next_page_info(response.headers.get("Link", ""))
+            if not next_page_info:
                 break
 
             params = {
                 "limit": 250,
-                "page_info": page_info,
+                "page_info": next_page_info,
                 "fields": "id,title,handle,vendor,status,variants",
             }
 
         return products
-
-    def _fetch_next_page_info_for_products(self, params: dict) -> str | None:
-        self._get_valid_access_token()
-        url = f"{self.base_url}/products.json"
-
-        self._throttle()
-        response = self.session.get(
-            url,
-            params=params,
-            timeout=self.settings.request_timeout,
-        )
-
-        if response.status_code == 401:
-            self._access_token = None
-            self._access_token_expires_at = 0.0
-            self._get_valid_access_token()
-            self._throttle()
-            response = self.session.get(
-                url,
-                params=params,
-                timeout=self.settings.request_timeout,
-            )
-
-        if response.status_code == 429:
-            retry_after_header = clean_text(response.headers.get("Retry-After"))
-            try:
-                retry_after = float(retry_after_header) if retry_after_header else 2.0
-            except Exception:
-                retry_after = 2.0
-            time.sleep(max(retry_after, 2.0))
-
-            self._throttle()
-            response = self.session.get(
-                url,
-                params=params,
-                timeout=self.settings.request_timeout,
-            )
-
-        response.raise_for_status()
-        return self._extract_next_page_info(response.headers.get("Link", ""))
 
     @staticmethod
     def _extract_next_page_info(link_header: str) -> str | None:
@@ -339,15 +313,6 @@ class ShopifyClient:
         }
         self._post("/inventory_levels/set.json", payload)
 
-    def update_variant_price(self, variant_id: int, new_price: float) -> None:
-        payload = {
-            "variant": {
-                "id": int(variant_id),
-                "price": f"{float(new_price):.2f}",
-            }
-        }
-        self._put(f"/variants/{variant_id}.json", payload)
-
     def update_variant_inventory_policy(self, variant_id: int, allow_backorder: bool) -> None:
         payload = {
             "variant": {
@@ -360,7 +325,6 @@ class ShopifyClient:
     def create_product(self, product: ProductRecord, content: GeneratedContent) -> dict:
         variants = [self._variant_payload(product, variant) for variant in product.variants]
         unique_images = self._unique_product_images(product, content)
-
         create_images = unique_images[:1]
 
         payload = {
@@ -410,58 +374,10 @@ class ShopifyClient:
         self._put(f"/products/{product_id}.json", payload)
 
     def update_product_images(self, product_id: int, product: ProductRecord, content: GeneratedContent) -> None:
-        unique_images = self._unique_product_images(product, content)
-        if not unique_images:
-            return
-
-        time.sleep(1.5)
-
-        existing = self._get(f"/products/{product_id}/images.json")
-        existing_images = existing.get("images", []) if isinstance(existing, dict) else []
-
-        existing_srcs = {
-            self._normalize_image_src(clean_text(img.get("src")))
-            for img in existing_images
-            if clean_text(img.get("src"))
-        }
-
-        for image_payload in unique_images:
-            normalized_src = self._normalize_image_src(clean_text(image_payload.get("src")))
-            if not normalized_src or normalized_src in existing_srcs:
-                continue
-
-            self._post_product_image_with_retry(product_id, image_payload)
-            existing_srcs.add(normalized_src)
-
-    def _post_product_image_with_retry(self, product_id: int, image_payload: dict, max_attempts: int = 5) -> None:
-        last_exc = None
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                self._post(f"/products/{product_id}/images.json", {"image": image_payload})
-                return
-            except requests.HTTPError as exc:
-                last_exc = exc
-                status = exc.response.status_code if exc.response is not None else None
-
-                if status == 409:
-                    sleep_for = min(1.5 * attempt, 6)
-                    logger.warning(
-                        "Shopify says product %s is being modified. Sleeping %.1fs before retrying image upload.",
-                        product_id,
-                        sleep_for,
-                    )
-                    time.sleep(sleep_for)
-                    continue
-
-                if status == 422:
-                    logger.warning("Shopify rejected one image payload for product %s. Skipping it.", product_id)
-                    return
-
-                raise
-
-        if last_exc:
-            raise last_exc
+        # Intentionally disabled for speed and stability.
+        # Product is created with the first image only.
+        # Consecutive runs should not modify images.
+        return
 
     def _unique_product_images(self, product: ProductRecord, content: GeneratedContent) -> List[dict]:
         payloads: List[dict] = []

@@ -48,7 +48,12 @@ class SyncOrchestrator:
         return results
 
     def _prepare_product(self, product: ProductRecord) -> None:
-        product.vendor = product.resolved_vendor() if hasattr(product, "resolved_vendor") else (product.vendor or product.brand)
+        product.vendor = (
+            product.resolved_vendor()
+            if hasattr(product, "resolved_vendor")
+            else (getattr(product, "vendor", "") or product.brand)
+        )
+
         product.normalized_title = self._normalized_product_title(product)
         product.handle = to_handle(product.normalized_title or product.title or product.handle)
 
@@ -56,23 +61,20 @@ class SyncOrchestrator:
             variant.price = variant.price or product.price
 
     def _normalized_product_title(self, product: ProductRecord) -> str:
+        """
+        Keep the source title authoritative.
+
+        Do NOT append Men's / Women's / Unisex based on collection or guesswork.
+        Do NOT rewrite one gender into another.
+        Just lightly clean season suffixes and duplicate trailing shoe labels.
+        """
         title = clean_text(product.title)
 
         title = re_sub(r"\s*\|\s*fall/winter\s+\d{4}\s*$", "", title)
         title = re_sub(r"\s*\|\s*spring/summer\s+\d{4}\s*$", "", title)
-        title = re_sub(r"\s*-\s*men['’]s\s*$", "", title)
-        title = re_sub(r"\s*-\s*women['’]s\s*$", "", title)
         title = re_sub(r"\s{2,}", " ", title).strip()
 
-        lowered = product.title.lower()
-        if "men" in lowered or "men's" in lowered or "mens" in lowered:
-            suffix = " Men's Shoes"
-        elif "women" in lowered or "women's" in lowered or "womens" in lowered:
-            suffix = " Women's Shoes"
-        else:
-            suffix = " Shoes"
-
-        return f"{title}{suffix}".strip()
+        return title
 
     def _sync_product(
         self,
@@ -85,51 +87,62 @@ class SyncOrchestrator:
         content = self.content_generator.generate(product)
         matched_parent = self.shopify.find_product_ref(product, product_index)
 
-        if matched_parent:
-            self._update_parent_product(matched_parent, product, content, results, counters)
-
         existing_sku_found = any(v.sku in sku_index for v in product.variants)
 
-        if not matched_parent:
-            if existing_sku_found:
-                results.add(
-                    SyncAction(
-                        sku="",
-                        action="skip_create_product_existing_skus",
-                        status="skipped",
-                        product_title=product.resolved_title(),
-                        notes="Skipped creating product because at least one SKU already exists in Shopify",
-                    )
-                )
-                counters["skipped_existing_sku_product"] += 1
-                return
-
-            matched_parent = self._create_parent_product(
-                product,
-                content,
-                sku_index,
-                product_index,
-                results,
-                counters,
+        # Existing product or any existing SKU:
+        # stock-only mode
+        if matched_parent or existing_sku_found:
+            self._sync_existing_product_stock_only(
+                matched_parent=matched_parent,
+                product=product,
+                sku_index=sku_index,
+                product_index=product_index,
+                results=results,
+                counters=counters,
             )
+            return
 
-            if self.dry_run:
-                return
+        # New product:
+        # full create is allowed once
+        matched_parent = self._create_parent_product(
+            product,
+            content,
+            sku_index,
+            product_index,
+            results,
+            counters,
+        )
+
+        if self.dry_run:
+            return
 
         scraped_skus: Set[str] = set()
 
         for variant in product.variants:
             scraped_skus.add(variant.sku)
-            target_qty = variant.normalized_inventory()
 
             existing = sku_index.get(variant.sku)
             if existing:
-                self._update_existing_variant(existing, product, variant, target_qty, results, counters)
+                self._update_existing_variant_stock_only(
+                    existing=existing,
+                    product=product,
+                    variant=variant,
+                    target_qty=variant.normalized_inventory(),
+                    results=results,
+                    counters=counters,
+                )
                 continue
 
             parent_ref = matched_parent or self.shopify.find_product_ref(product, product_index)
             if parent_ref:
-                self._create_missing_variant(parent_ref, product, variant, sku_index, results, counters)
+                self._create_missing_variant(
+                    parent_ref=parent_ref,
+                    product=product,
+                    variant=variant,
+                    sku_index=sku_index,
+                    results=results,
+                    counters=counters,
+                )
             else:
                 results.add(
                     SyncAction(
@@ -144,37 +157,72 @@ class SyncOrchestrator:
 
         if matched_parent and product.scrape_ok_for_zeroing:
             self._zero_missing_variants(
-                matched_parent,
-                scraped_skus,
-                sku_index,
-                product,
-                results,
-                counters,
+                matched_parent=matched_parent,
+                scraped_skus=scraped_skus,
+                sku_index=sku_index,
+                product=product,
+                results=results,
+                counters=counters,
             )
 
-    def _update_parent_product(
+    def _sync_existing_product_stock_only(
         self,
-        matched_parent: ShopifyProductMatch,
+        matched_parent: ShopifyProductMatch | None,
         product: ProductRecord,
-        content,
+        sku_index: Dict[str, ShopifyVariantMatch],
+        product_index: Dict[str, ShopifyProductMatch],
         results: SyncResults,
         counters: Counter,
     ) -> None:
-        if self.dry_run:
-            results.add(
-                SyncAction(
-                    sku="",
-                    action="update_product",
-                    status="dry_run",
-                    product_title=product.resolved_title(),
-                    notes=f"Would update Shopify product {matched_parent.product_id} body, SEO, title, tags, and images",
-                )
-            )
-        else:
-            self.shopify.update_product_seo_and_body(matched_parent.product_id, product, content)
-            self.shopify.update_product_images(matched_parent.product_id, product, content)
+        """
+        Existing Shopify products should only update stock.
+        No title updates.
+        No description updates.
+        No tag updates.
+        No image updates.
+        No price updates.
+        No variant creation.
+        """
+        if not matched_parent:
+            matched_parent = self.shopify.find_product_ref(product, product_index)
 
-        counters["updated_products"] += 1
+        scraped_skus: Set[str] = set()
+
+        for variant in product.variants:
+            scraped_skus.add(variant.sku)
+            existing = sku_index.get(variant.sku)
+
+            if not existing:
+                results.add(
+                    SyncAction(
+                        sku=variant.sku,
+                        action="skip_missing_existing_variant",
+                        status="skipped",
+                        product_title=product.resolved_title(),
+                        notes="Existing product is in stock-only mode; missing variant was not created",
+                    )
+                )
+                counters["skipped_missing_variants"] += 1
+                continue
+
+            self._update_existing_variant_stock_only(
+                existing=existing,
+                product=product,
+                variant=variant,
+                target_qty=variant.normalized_inventory(),
+                results=results,
+                counters=counters,
+            )
+
+        if matched_parent and product.scrape_ok_for_zeroing:
+            self._zero_missing_variants(
+                matched_parent=matched_parent,
+                scraped_skus=scraped_skus,
+                sku_index=sku_index,
+                product=product,
+                results=results,
+                counters=counters,
+            )
 
     def _create_parent_product(
         self,
@@ -202,6 +250,7 @@ class SyncOrchestrator:
         created_product = created["product"]
         product_id = int(created_product["id"])
 
+        # Only on first creation do we write content/images/SEO
         self.shopify.update_product_seo_and_body(product_id, product, content)
         self.shopify.update_product_images(product_id, product, content)
 
@@ -260,7 +309,7 @@ class SyncOrchestrator:
         counters["created_products"] += 1
         return matched_parent
 
-    def _update_existing_variant(
+    def _update_existing_variant_stock_only(
         self,
         existing: ShopifyVariantMatch,
         product: ProductRecord,
@@ -269,25 +318,6 @@ class SyncOrchestrator:
         results: SyncResults,
         counters: Counter,
     ) -> None:
-        if variant.price is not None and (
-            existing.price is None or round(existing.price, 2) != round(variant.price, 2)
-        ):
-            if self.dry_run:
-                results.add(
-                    SyncAction(
-                        sku=variant.sku,
-                        action="update_price",
-                        status="dry_run",
-                        old_price=existing.price,
-                        new_price=variant.price,
-                        product_title=product.resolved_title(),
-                    )
-                )
-            else:
-                self.shopify.update_variant_price(existing.variant_id, variant.price)
-
-            counters["updated_prices"] += 1
-
         if self.dry_run:
             results.add(
                 SyncAction(
@@ -297,6 +327,7 @@ class SyncOrchestrator:
                     old_quantity=existing.inventory_quantity,
                     new_quantity=target_qty,
                     product_title=product.resolved_title(),
+                    notes="Stock-only mode for existing product",
                 )
             )
         else:
@@ -323,7 +354,7 @@ class SyncOrchestrator:
                     status="dry_run",
                     product_title=product.resolved_title(),
                     new_quantity=variant.normalized_inventory(),
-                    notes="Would append missing variant to existing Shopify product",
+                    notes="Would append missing variant to new Shopify product",
                 )
             )
             counters["created_variants"] += 1

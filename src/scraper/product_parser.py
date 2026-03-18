@@ -34,7 +34,6 @@ class ProductParser:
         images = self._extract_images(product_url, soup)
 
         gender = self._detect_gender(title)
-
         series, model = infer_series_and_model(title=title, brand=brand)
 
         record_kwargs = dict(
@@ -51,8 +50,6 @@ class ProductParser:
             images=images,
         )
 
-        # Add gender only if ProductRecord supports it.
-        # This avoids breaking runs if src/models.py has not been updated yet.
         try:
             record = ProductRecord(
                 **record_kwargs,
@@ -76,15 +73,12 @@ class ProductParser:
         if not value:
             return ""
 
-        # Highest priority
         if re.search(r"\bunisex\b", value):
             return "Unisex"
 
-        # Women's variations
         if re.search(r"\bwomen'?s\b|\bwomen\b|\bwomens\b", value):
             return "Women's"
 
-        # Men's variations
         if re.search(r"\bmen'?s\b|\bmen\b|\bmens\b", value):
             return "Men's"
 
@@ -279,73 +273,73 @@ class ProductParser:
         return gallery_images[: self.MAX_IMAGES]
 
     def _extract_images_from_jsonld(
-    self,
-    product_url: str,
-    soup: BeautifulSoup,
-    title: str,
-) -> List[ProductImage]:
-    results: List[ProductImage] = []
-    seen_srcs = set()
-    color_to_image = {}
+        self,
+        product_url: str,
+        soup: BeautifulSoup,
+        title: str,
+    ) -> List[ProductImage]:
+        results: List[ProductImage] = []
+        seen_srcs = set()
+        color_to_image = {}
 
-    for script in soup.select('script[type="application/ld+json"]'):
-        raw = script.string or script.get_text(" ", strip=True)
-        if not raw:
-            continue
-
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("@type") != "ProductGroup":
+        for script in soup.select('script[type="application/ld+json"]'):
+            raw = script.string or script.get_text(" ", strip=True)
+            if not raw:
                 continue
 
-            for variant in item.get("hasVariant", []) or []:
-                if not isinstance(variant, dict):
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("@type") != "ProductGroup":
                     continue
 
-                color = clean_text(str(variant.get("color", ""))) or "Default"
-                color_key = color.lower()
-
-                image_nodes = variant.get("image") or []
-                if isinstance(image_nodes, dict):
-                    image_nodes = [image_nodes]
-
-                for image_node in image_nodes:
-                    if not isinstance(image_node, dict):
+                for variant in item.get("hasVariant", []) or []:
+                    if not isinstance(variant, dict):
                         continue
 
-                    src = clean_text(
-                        image_node.get("contentUrl")
-                        or image_node.get("url")
-                        or ""
-                    )
-                    if not src:
-                        continue
+                    color = clean_text(str(variant.get("color", ""))) or "Default"
+                    color_key = color.lower()
 
-                    src = absolute_url(product_url, src)
-                    if not self._is_valid_product_image(src):
-                        continue
+                    image_nodes = variant.get("image") or []
+                    if isinstance(image_nodes, dict):
+                        image_nodes = [image_nodes]
 
-                    normalized_src = self._normalize_image_src(src)
-                    if normalized_src in seen_srcs:
-                        continue
+                    for image_node in image_nodes:
+                        if not isinstance(image_node, dict):
+                            continue
 
-                    if color_key not in color_to_image:
-                        alt = clean_text(image_node.get("description")) or f"{title} - {color}"
-                        color_to_image[color_key] = ProductImage(src=src, alt=alt or title)
-                        seen_srcs.add(normalized_src)
-                    break
+                        src = clean_text(
+                            image_node.get("contentUrl")
+                            or image_node.get("url")
+                            or ""
+                        )
+                        if not src:
+                            continue
 
-    for _, image in color_to_image.items():
-        results.append(image)
+                        src = absolute_url(product_url, src)
+                        if not self._is_valid_product_image(src):
+                            continue
 
-    return results
+                        normalized_src = self._normalize_image_src(src)
+                        if normalized_src in seen_srcs:
+                            continue
+
+                        if color_key not in color_to_image:
+                            alt = clean_text(image_node.get("description")) or f"{title} - {color}"
+                            color_to_image[color_key] = ProductImage(src=src, alt=alt or title)
+                            seen_srcs.add(normalized_src)
+                        break
+
+        for _, image in color_to_image.items():
+            results.append(image)
+
+        return results
 
     def _extract_images_from_gallery(
         self,

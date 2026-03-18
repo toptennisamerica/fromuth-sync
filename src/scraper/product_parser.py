@@ -279,73 +279,73 @@ class ProductParser:
         return gallery_images[: self.MAX_IMAGES]
 
     def _extract_images_from_jsonld(
-        self,
-        product_url: str,
-        soup: BeautifulSoup,
-        title: str,
-    ) -> List[ProductImage]:
-        results: List[ProductImage] = []
-        seen_srcs = set()
-        color_to_image = {}
+    self,
+    product_url: str,
+    soup: BeautifulSoup,
+    title: str,
+) -> List[ProductImage]:
+    results: List[ProductImage] = []
+    seen_srcs = set()
+    color_to_image = {}
 
-        for script in soup.select('script[type="application/ld+json"]'):
-            raw = script.string or script.get_text(" ", strip=True)
-            if not raw:
+    for script in soup.select('script[type="application/ld+json"]'):
+        raw = script.string or script.get_text(" ", strip=True)
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("@type") != "ProductGroup":
                 continue
 
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("@type") != "ProductGroup":
+            for variant in item.get("hasVariant", []) or []:
+                if not isinstance(variant, dict):
                     continue
 
-                for variant in item.get("hasVariant", []) or []:
-                    if not isinstance(variant, dict):
+                color = clean_text(str(variant.get("color", ""))) or "Default"
+                color_key = color.lower()
+
+                image_nodes = variant.get("image") or []
+                if isinstance(image_nodes, dict):
+                    image_nodes = [image_nodes]
+
+                for image_node in image_nodes:
+                    if not isinstance(image_node, dict):
                         continue
 
-                    color = clean_text(str(variant.get("color", ""))) or "Default"
-                    color_key = color.lower()
+                    src = clean_text(
+                        image_node.get("contentUrl")
+                        or image_node.get("url")
+                        or ""
+                    )
+                    if not src:
+                        continue
 
-                    image_nodes = variant.get("image") or []
-                    if isinstance(image_nodes, dict):
-                        image_nodes = [image_nodes]
+                    src = absolute_url(product_url, src)
+                    if not self._is_valid_product_image(src):
+                        continue
 
-                    for image_node in image_nodes:
-                        if not isinstance(image_node, dict):
-                            continue
+                    normalized_src = self._normalize_image_src(src)
+                    if normalized_src in seen_srcs:
+                        continue
 
-                            src = clean_text(
-                                image_node.get("contentUrl")
-                                or image_node.get("url")
-                                or ""
-                            )
-                        if not src:
-                            continue
+                    if color_key not in color_to_image:
+                        alt = clean_text(image_node.get("description")) or f"{title} - {color}"
+                        color_to_image[color_key] = ProductImage(src=src, alt=alt or title)
+                        seen_srcs.add(normalized_src)
+                    break
 
-                        src = absolute_url(product_url, src)
-                        if not self._is_valid_product_image(src):
-                            continue
+    for _, image in color_to_image.items():
+        results.append(image)
 
-                        normalized_src = self._normalize_image_src(src)
-                        if normalized_src in seen_srcs:
-                            continue
-
-                        if color_key not in color_to_image:
-                            alt = clean_text(image_node.get("description")) or f"{title} - {color}"
-                            color_to_image[color_key] = ProductImage(src=src, alt=alt or title)
-                            seen_srcs.add(normalized_src)
-                        break
-
-        for _, image in color_to_image.items():
-            results.append(image)
-
-        return results
+    return results
 
     def _extract_images_from_gallery(
         self,

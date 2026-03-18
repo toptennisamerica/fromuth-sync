@@ -246,8 +246,10 @@ class SyncOrchestrator:
         created_product = created["product"]
         product_id = int(created_product["id"])
 
-        # Only on initial creation do we write content/body/SEO.
-        self.shopify.update_product_seo_and_body(product_id, product, content)
+        # IMPORTANT:
+        # Do NOT update title/body/SEO again here.
+        # create_product() already sends all of that.
+        # A second immediate PUT causes 409 conflicts.
 
         variant_ids = []
         for created_variant in created_product.get("variants", []):

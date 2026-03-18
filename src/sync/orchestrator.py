@@ -63,10 +63,7 @@ class SyncOrchestrator:
     def _normalized_product_title(self, product: ProductRecord) -> str:
         """
         Keep the source title authoritative.
-
-        Do NOT append Men's / Women's / Unisex based on collection or guesswork.
-        Do NOT rewrite one gender into another.
-        Just lightly clean season suffixes and duplicate trailing shoe labels.
+        Do not append or infer Men's / Women's / Unisex here.
         """
         title = clean_text(product.title)
 
@@ -86,11 +83,9 @@ class SyncOrchestrator:
     ) -> None:
         content = self.content_generator.generate(product)
         matched_parent = self.shopify.find_product_ref(product, product_index)
-
         existing_sku_found = any(v.sku in sku_index for v in product.variants)
 
-        # Existing product or any existing SKU:
-        # stock-only mode
+        # Existing product or any existing SKU: stock-only mode
         if matched_parent or existing_sku_found:
             self._sync_existing_product_stock_only(
                 matched_parent=matched_parent,
@@ -102,15 +97,14 @@ class SyncOrchestrator:
             )
             return
 
-        # New product:
-        # full create is allowed once
+        # New product: create full listing once
         matched_parent = self._create_parent_product(
-            product,
-            content,
-            sku_index,
-            product_index,
-            results,
-            counters,
+            product=product,
+            content=content,
+            sku_index=sku_index,
+            product_index=product_index,
+            results=results,
+            counters=counters,
         )
 
         if self.dry_run:
@@ -120,8 +114,8 @@ class SyncOrchestrator:
 
         for variant in product.variants:
             scraped_skus.add(variant.sku)
-
             existing = sku_index.get(variant.sku)
+
             if existing:
                 self._update_existing_variant_stock_only(
                     existing=existing,
@@ -278,11 +272,6 @@ class SyncOrchestrator:
                 option2=clean_text(created_variant.get("option2")),
             )
 
-        for variant in product.variants:
-            ref = sku_index.get(variant.sku)
-            if ref and ref.inventory_item_id:
-                self.shopify.set_inventory(ref.inventory_item_id, variant.normalized_inventory())
-
         matched_parent = ShopifyProductMatch(
             product_id=product_id,
             title=clean_text(created_product.get("title")),
@@ -318,6 +307,21 @@ class SyncOrchestrator:
         results: SyncResults,
         counters: Counter,
     ) -> None:
+        if existing.inventory_quantity == target_qty:
+            results.add(
+                SyncAction(
+                    sku=variant.sku,
+                    action="skip_inventory_unchanged",
+                    status="skipped",
+                    old_quantity=existing.inventory_quantity,
+                    new_quantity=target_qty,
+                    product_title=product.resolved_title(),
+                    notes="Inventory already matches target quantity",
+                )
+            )
+            counters["skipped_unchanged_inventory"] += 1
+            return
+
         if self.dry_run:
             results.add(
                 SyncAction(
@@ -408,6 +412,21 @@ class SyncOrchestrator:
 
         for shopify_sku, ref in product_variants.items():
             if shopify_sku in scraped_skus:
+                continue
+
+            if ref.inventory_quantity == 0:
+                results.add(
+                    SyncAction(
+                        sku=shopify_sku,
+                        action="skip_zero_already_zero",
+                        status="skipped",
+                        old_quantity=ref.inventory_quantity,
+                        new_quantity=0,
+                        product_title=product.resolved_title(),
+                        notes="Variant missing from current structured Fromuth data, but already zero in Shopify",
+                    )
+                )
+                counters["skipped_already_zero"] += 1
                 continue
 
             if self.dry_run:

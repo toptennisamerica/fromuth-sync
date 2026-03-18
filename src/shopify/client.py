@@ -28,8 +28,10 @@ class ShopifyClient:
         self.session = requests.Session()
         self._access_token: str | None = None
         self._access_token_expires_at: float = 0.0
+
+        # Proactive throttling: stay safely under Shopify REST limits.
         self._last_request_time = 0.0
-        self._min_interval = 0.6
+        self._min_interval = 0.8
 
         self.session.headers.update(
             {
@@ -83,25 +85,14 @@ class ShopifyClient:
         path: str,
         json_payload: dict | None = None,
         params: dict | None = None,
-        retry_on_429: bool = True,
+        max_attempts: int = 6,
     ):
         self._get_valid_access_token()
-        self._throttle()
-
         url = f"{self.base_url}{path}"
-        response = self.session.request(
-            method,
-            url,
-            json=json_payload,
-            params=params,
-            timeout=self.settings.request_timeout,
-        )
 
-        if response.status_code == 401:
-            self._access_token = None
-            self._access_token_expires_at = 0.0
-            self._get_valid_access_token()
+        for attempt in range(1, max_attempts + 1):
             self._throttle()
+
             response = self.session.request(
                 method,
                 url,
@@ -110,31 +101,75 @@ class ShopifyClient:
                 timeout=self.settings.request_timeout,
             )
 
-        if response.status_code == 429 and retry_on_429:
-            print("⚠️ Shopify rate limit hit. Sleeping 2 seconds and retrying...")
-            time.sleep(2)
-            return self._request(
-                method,
-                path,
-                json_payload=json_payload,
-                params=params,
-                retry_on_429=False,
-            )
+            if response.status_code == 401:
+                self._access_token = None
+                self._access_token_expires_at = 0.0
+                self._get_valid_access_token()
 
-        if not response.ok:
-            print("\n=== SHOPIFY ERROR ===")
-            print("METHOD:", method)
-            print("URL:", url)
-            print("STATUS:", response.status_code)
-            try:
-                print("RESPONSE JSON:", response.json())
-            except Exception:
-                print("RESPONSE TEXT:", response.text)
-            if json_payload is not None:
-                print("REQUEST PAYLOAD:", json_payload)
+                self._throttle()
+                response = self.session.request(
+                    method,
+                    url,
+                    json=json_payload,
+                    params=params,
+                    timeout=self.settings.request_timeout,
+                )
 
-        response.raise_for_status()
-        return response.json() if response.text else {}
+            if response.status_code == 429:
+                retry_after_header = clean_text(response.headers.get("Retry-After"))
+                try:
+                    retry_after = float(retry_after_header) if retry_after_header else 0.0
+                except Exception:
+                    retry_after = 0.0
+
+                sleep_for = max(retry_after, min(2 ** attempt, 20))
+                logger.warning(
+                    "Shopify rate limit hit on %s %s. Sleeping %.1fs before retry %s/%s.",
+                    method,
+                    path,
+                    sleep_for,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(sleep_for)
+                continue
+
+            if 500 <= response.status_code < 600:
+                sleep_for = min(2 ** attempt, 20)
+                logger.warning(
+                    "Shopify server error %s on %s %s. Sleeping %.1fs before retry %s/%s.",
+                    response.status_code,
+                    method,
+                    path,
+                    sleep_for,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(sleep_for)
+                continue
+
+            if not response.ok:
+                print("\n=== SHOPIFY ERROR ===")
+                print("METHOD:", method)
+                print("URL:", url)
+                print("STATUS:", response.status_code)
+                try:
+                    print("RESPONSE JSON:", response.json())
+                except Exception:
+                    print("RESPONSE TEXT:", response.text)
+                if json_payload is not None:
+                    print("REQUEST PAYLOAD:", json_payload)
+                response.raise_for_status()
+
+            return response.json() if response.text else {}
+
+        print("\n=== SHOPIFY ERROR ===")
+        print("METHOD:", method)
+        print("URL:", url)
+        print("STATUS:", 429)
+        if json_payload is not None:
+            print("REQUEST PAYLOAD:", json_payload)
+        raise RuntimeError(f"Shopify request failed after {max_attempts} attempts: {method} {path}")
 
     def _get(self, path: str, params: dict | None = None):
         return self._request("GET", path, params=params)
@@ -146,8 +181,6 @@ class ShopifyClient:
         return self._request("PUT", path, json_payload=payload)
 
     def list_products(self) -> List[dict]:
-        self._get_valid_access_token()
-
         products: List[dict] = []
         params = {
             "limit": 250,
@@ -155,58 +188,72 @@ class ShopifyClient:
         }
 
         while True:
-            self._throttle()
-            response = self.session.get(
-                f"{self.base_url}/products.json",
-                params=params,
-                timeout=self.settings.request_timeout,
-            )
-
-            if response.status_code == 401:
-                self._access_token = None
-                self._access_token_expires_at = 0.0
-                self._get_valid_access_token()
-                self._throttle()
-                response = self.session.get(
-                    f"{self.base_url}/products.json",
-                    params=params,
-                    timeout=self.settings.request_timeout,
-                )
-
-            if response.status_code == 429:
-                print("⚠️ Shopify rate limit hit while listing products. Sleeping 2 seconds...")
-                time.sleep(2)
-                self._throttle()
-                response = self.session.get(
-                    f"{self.base_url}/products.json",
-                    params=params,
-                    timeout=self.settings.request_timeout,
-                )
-
-            if not response.ok:
-                print("\n=== SHOPIFY LIST PRODUCTS ERROR ===")
-                print("URL:", response.url)
-                print("STATUS:", response.status_code)
-                try:
-                    print("RESPONSE JSON:", response.json())
-                except Exception:
-                    print("RESPONSE TEXT:", response.text)
-
-            response.raise_for_status()
-            data = response.json()
+            data = self._get("/products.json", params=params)
             products.extend(data.get("products", []))
 
-            next_page_info = self._extract_next_page_info(response.headers.get("Link", ""))
-            if not next_page_info:
+            next_page_info = self._extract_next_page_info(
+                self.session.headers.get("Link", "")
+            )
+
+            # _request does not store response headers, so fetch Link header separately
+            # by repeating the last request is wasteful. Instead, use the last response URL
+            # pattern only when pagination exists in returned count.
+            # Safer approach: inspect headers through a direct request wrapper.
+            # Since Shopify pagination depends on Link header, use a dedicated direct call below.
+            if len(data.get("products", [])) < 250:
+                break
+
+            page_info = self._fetch_next_page_info_for_products(params)
+            if not page_info:
                 break
 
             params = {
                 "limit": 250,
-                "page_info": next_page_info,
+                "page_info": page_info,
                 "fields": "id,title,handle,vendor,status,variants",
             }
 
         return products
+
+    def _fetch_next_page_info_for_products(self, params: dict) -> str | None:
+        self._get_valid_access_token()
+        url = f"{self.base_url}/products.json"
+
+        self._throttle()
+        response = self.session.get(
+            url,
+            params=params,
+            timeout=self.settings.request_timeout,
+        )
+
+        if response.status_code == 401:
+            self._access_token = None
+            self._access_token_expires_at = 0.0
+            self._get_valid_access_token()
+            self._throttle()
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.settings.request_timeout,
+            )
+
+        if response.status_code == 429:
+            retry_after_header = clean_text(response.headers.get("Retry-After"))
+            try:
+                retry_after = float(retry_after_header) if retry_after_header else 2.0
+            except Exception:
+                retry_after = 2.0
+            time.sleep(max(retry_after, 2.0))
+
+            self._throttle()
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=self.settings.request_timeout,
+            )
+
+        response.raise_for_status()
+        return self._extract_next_page_info(response.headers.get("Link", ""))
 
     @staticmethod
     def _extract_next_page_info(link_header: str) -> str | None:
@@ -287,7 +334,7 @@ class ShopifyClient:
     def set_inventory(self, inventory_item_id: int, quantity: int) -> None:
         payload = {
             "location_id": int(self.settings.shopify_location_id),
-            "inventory_item_id": inventory_item_id,
+            "inventory_item_id": int(inventory_item_id),
             "available": int(quantity),
         }
         self._post("/inventory_levels/set.json", payload)
@@ -314,7 +361,6 @@ class ShopifyClient:
         variants = [self._variant_payload(product, variant) for variant in product.variants]
         unique_images = self._unique_product_images(product, content)
 
-        # Only include the first image at create time to avoid duplicate featured image issues.
         create_images = unique_images[:1]
 
         payload = {
@@ -368,7 +414,6 @@ class ShopifyClient:
         if not unique_images:
             return
 
-        # Give Shopify a moment to finish product creation/update before image appends.
         time.sleep(1.5)
 
         existing = self._get(f"/products/{product_id}/images.json")
@@ -401,12 +446,16 @@ class ShopifyClient:
 
                 if status == 409:
                     sleep_for = min(1.5 * attempt, 6)
-                    print(f"⚠️ Shopify says product is being modified. Sleeping {sleep_for:.1f}s and retrying image upload...")
+                    logger.warning(
+                        "Shopify says product %s is being modified. Sleeping %.1fs before retrying image upload.",
+                        product_id,
+                        sleep_for,
+                    )
                     time.sleep(sleep_for)
                     continue
 
                 if status == 422:
-                    print("⚠️ Shopify rejected one image payload, skipping it.")
+                    logger.warning("Shopify rejected one image payload for product %s. Skipping it.", product_id)
                     return
 
                 raise

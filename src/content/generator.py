@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from collections import OrderedDict
 from html import escape
 from typing import Dict, List
 
@@ -12,15 +11,40 @@ from src.utils import clean_text
 class ContentGenerator:
     def generate(self, product: ProductRecord) -> GeneratedContent:
         title = self._resolved_title(product)
-        brand = clean_text(product.resolved_vendor() if hasattr(product, "resolved_vendor") else (product.vendor or product.brand))
+        brand = clean_text(
+            product.resolved_vendor()
+            if hasattr(product, "resolved_vendor")
+            else (getattr(product, "vendor", "") or product.brand)
+        )
         model = clean_text(product.model or self._model_from_title(title, brand))
         product_type = clean_text(product.product_type or "Tennis Shoes")
 
-        body_html = self._build_body(product, title=title, brand=brand, model=model, product_type=product_type)
+        body_html = self._build_body(
+            product,
+            title=title,
+            brand=brand,
+            model=model,
+            product_type=product_type,
+        )
         seo_title = self._build_seo_title(title)
-        meta_description = self._build_meta_description(product, title=title, brand=brand, model=model)
-        tags = self._build_tags(product, brand=brand, model=model, product_type=product_type)
-        image_alt_by_src = self._build_image_alts(product, title=title, brand=brand, model=model)
+        meta_description = self._build_meta_description(
+            product,
+            title=title,
+            brand=brand,
+            model=model,
+        )
+        tags = self._build_tags(
+            product,
+            brand=brand,
+            model=model,
+            product_type=product_type,
+        )
+        image_alt_by_src = self._build_image_alts(
+            product,
+            title=title,
+            brand=brand,
+            model=model,
+        )
 
         return GeneratedContent(
             body_html=body_html,
@@ -33,18 +57,25 @@ class ContentGenerator:
     def _resolved_title(self, product: ProductRecord) -> str:
         if hasattr(product, "resolved_title"):
             return clean_text(product.resolved_title())
-        return clean_text(product.normalized_title or product.title)
+        return clean_text(getattr(product, "normalized_title", "") or product.title)
 
     def _build_body(self, product: ProductRecord, title: str, brand: str, model: str, product_type: str) -> str:
-        audience = self._audience_from_title(title)
+        audience = self._audience_from_product(product, title)
+        audience_phrase = self._audience_phrase_from_product(product, title)
         sport_text = self._sport_text(product)
         profile = self._play_profile(title, model)
         benefit_1, benefit_2 = self._benefit_pair(title, model)
         feature_bullets = self._feature_bullets(title, model, brand, sport_text)
-        specs = self._spec_pairs(product, brand=brand, model=model, product_type=product_type, sport_text=sport_text)
+        specs = self._spec_pairs(
+            product,
+            brand=brand,
+            model=model,
+            product_type=product_type,
+            sport_text=sport_text,
+        )
 
         p1 = (
-            f"<p><strong>{escape(title)}</strong> are a strong choice for {escape(audience)} "
+            f"<p><strong>{escape(title)}</strong> are a strong choice for {escape(audience_phrase)} "
             f"who want {escape(benefit_1)} and {escape(benefit_2)}. "
             f"Built for {escape(sport_text)}, this model is designed to help players move with confidence "
             f"during practice sessions, match play, and long days on court.</p>"
@@ -76,9 +107,9 @@ class ContentGenerator:
         return title[:62].rstrip(" -|,") + "..."
 
     def _build_meta_description(self, product: ProductRecord, title: str, brand: str, model: str) -> str:
-        audience = self._audience_from_title(title)
+        audience_phrase = self._audience_phrase_from_product(product, title)
         desc = (
-            f"Shop {brand} {model} for {audience.lower()} who want comfort, support, and dependable "
+            f"Shop {brand} {model} for {audience_phrase} who want comfort, support, and dependable "
             f"court performance."
         )
         desc = clean_text(desc)
@@ -97,8 +128,12 @@ class ContentGenerator:
             tags.append(product.series)
         tags.append(product_type)
 
-        audience = self._audience_from_title(title)
+        audience = self._audience_from_product(product, title)
         tags.append(audience)
+
+        gender = self._gender_from_product(product, title)
+        if gender:
+            tags.append(gender)
 
         for tag in self._benefit_tags(title, model):
             tags.append(tag)
@@ -159,7 +194,7 @@ class ContentGenerator:
         sport_text: str,
     ) -> List[tuple[str, str]]:
         title = self._resolved_title(product)
-        audience = self._audience_from_title(title)
+        audience = self._audience_from_product(product, title)
 
         specs = [
             ("Brand", brand),
@@ -238,17 +273,51 @@ class ContentGenerator:
 
         return tags
 
-    def _audience_from_title(self, title: str) -> str:
-        lowered = title.lower()
-        if "men's" in lowered or "mens" in lowered:
+    def _gender_from_product(self, product: ProductRecord, title: str) -> str:
+        product_gender = clean_text(getattr(product, "gender", ""))
+        if product_gender:
+            return product_gender
+
+        lowered = clean_text(title).lower()
+        if not lowered:
+            return ""
+
+        if re.search(r"\bunisex\b", lowered):
+            return "Unisex"
+
+        if re.search(r"\bwomen'?s\b|\bwomen\b|\bwomens\b", lowered):
+            return "Women's"
+
+        if re.search(r"\bmen'?s\b|\bmen\b|\bmens\b", lowered):
+            return "Men's"
+
+        return ""
+
+    def _audience_from_product(self, product: ProductRecord, title: str) -> str:
+        gender = self._gender_from_product(product, title)
+
+        if gender == "Men's":
             return "Men's Tennis Shoes"
-        if "women's" in lowered or "womens" in lowered:
+        if gender == "Women's":
             return "Women's Tennis Shoes"
+        if gender == "Unisex":
+            return "Unisex Tennis Shoes"
         return "Tennis Shoes"
+
+    def _audience_phrase_from_product(self, product: ProductRecord, title: str) -> str:
+        gender = self._gender_from_product(product, title)
+
+        if gender == "Men's":
+            return "men's tennis players"
+        if gender == "Women's":
+            return "women's tennis players"
+        if gender == "Unisex":
+            return "players looking for a unisex tennis shoe"
+        return "tennis players"
 
     def _court_type_from_title(self, title: str) -> str:
         lowered = title.lower()
-        if "ac" in lowered:
+        if re.search(r"\bac\b", lowered):
             return "All Court"
         if "clay" in lowered:
             return "Clay"
@@ -269,8 +338,11 @@ class ContentGenerator:
 
         clean_title = re.sub(r"\|\s*spring/summer\s+\d{4}", "", clean_title, flags=re.I).strip()
         clean_title = re.sub(r"\|\s*fall/winter\s+\d{4}", "", clean_title, flags=re.I).strip()
+        clean_title = re.sub(r"\bunisex shoes\b", "", clean_title, flags=re.I).strip()
         clean_title = re.sub(r"\bmen['’]s shoes\b", "", clean_title, flags=re.I).strip()
+        clean_title = re.sub(r"\bmens shoes\b", "", clean_title, flags=re.I).strip()
         clean_title = re.sub(r"\bwomen['’]s shoes\b", "", clean_title, flags=re.I).strip()
+        clean_title = re.sub(r"\bwomens shoes\b", "", clean_title, flags=re.I).strip()
         clean_title = re.sub(r"\bshoes\b", "", clean_title, flags=re.I).strip()
-        clean_title = clean_title.strip("- ").strip()
+        clean_title = clean_title.strip("-| ").strip()
         return clean_title

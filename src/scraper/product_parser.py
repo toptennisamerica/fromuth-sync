@@ -33,9 +33,11 @@ class ProductParser:
         specifications_html = self._extract_specifications_html(soup)
         images = self._extract_images(product_url, soup)
 
+        gender = self._detect_gender(title)
+
         series, model = infer_series_and_model(title=title, brand=brand)
 
-        record = ProductRecord(
+        record_kwargs = dict(
             product_url=product_url,
             handle=to_handle(title or product_url.rstrip("/").split("/")[-1]),
             title=title,
@@ -49,6 +51,18 @@ class ProductParser:
             images=images,
         )
 
+        # Add gender only if ProductRecord supports it.
+        # This avoids breaking runs if src/models.py has not been updated yet.
+        try:
+            record = ProductRecord(
+                **record_kwargs,
+                gender=gender,
+            )
+        except TypeError:
+            record = ProductRecord(**record_kwargs)
+            if hasattr(record, "gender"):
+                setattr(record, "gender", gender)
+
         variants, inventory_found, backorder_detected, notes = self._extract_variants(soup, price)
         record.variants = variants
         record.inventory_found = inventory_found
@@ -56,6 +70,25 @@ class ProductParser:
         record.notes.extend(notes)
         record.scrape_ok_for_zeroing = inventory_found and len(variants) > 0
         return record
+
+    def _detect_gender(self, text: str) -> str:
+        value = clean_text(text).lower()
+        if not value:
+            return ""
+
+        # Highest priority
+        if re.search(r"\bunisex\b", value):
+            return "Unisex"
+
+        # Women's variations
+        if re.search(r"\bwomen'?s\b|\bwomen\b|\bwomens\b", value):
+            return "Women's"
+
+        # Men's variations
+        if re.search(r"\bmen'?s\b|\bmen\b|\bmens\b", value):
+            return "Men's"
+
+        return ""
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
         selectors = [
@@ -287,11 +320,11 @@ class ProductParser:
                         if not isinstance(image_node, dict):
                             continue
 
-                        src = clean_text(
-                            image_node.get("contentUrl")
-                            or image_node.get("url")
-                            or ""
-                        )
+                            src = clean_text(
+                                image_node.get("contentUrl")
+                                or image_node.get("url")
+                                or ""
+                            )
                         if not src:
                             continue
 
@@ -303,7 +336,6 @@ class ProductParser:
                         if normalized_src in seen_srcs:
                             continue
 
-                        # keep first valid image for each color
                         if color_key not in color_to_image:
                             alt = clean_text(image_node.get("description")) or f"{title} - {color}"
                             color_to_image[color_key] = ProductImage(src=src, alt=alt or title)
